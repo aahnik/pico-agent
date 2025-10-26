@@ -1,4 +1,5 @@
-![pico-logo](pico.svg)
+
+<img src="pico.svg" alt="pico logo" width="150" height="150">
 
 # pico-agent
 
