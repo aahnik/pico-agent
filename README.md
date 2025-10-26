@@ -1,4 +1,8 @@
+![pico-logo](pico.svg)
+
 # pico-agent
+
+
 
 > pico (p) = $10^-12$ (trillionth)
 
