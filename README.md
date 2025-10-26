@@ -5,7 +5,7 @@
 
 
 
-> pico (p) = $10^-12$ (trillionth)
+> pico (p) = $$10^-12$$ (trillionth)
 
 _barebones alternative to langchain/langgraph, smolagents, pydantic ai etc_
 
