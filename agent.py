@@ -36,6 +36,9 @@ class Tool(ABC):
     def call(*args, **kwargs):
         pass
 
+    def execution_cache(*args, **kwargs):
+        pass
+
 
 class ToolEngine(ABC):
     # provides mechanism to decide which tool to call
