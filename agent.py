@@ -1,8 +1,30 @@
-from abc import ABC
+# pyright: reportExplicitAny=false
+# pyright: reportAny=false
+#
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from typing import Any
 import json
 import os
+
+from pydantic import BaseModel, Field
+
+
+class ToolResult(BaseModel):
+    """
+    Standard return type for tool execution.
+    Must contain at least a 'result' key with textual output for the LLM.
+    Can contain arbitrary additional keys for debugging/tracing.
+    """
+
+    result: str = Field(description="Textual result suitable for language model")
+
+    class Config:
+        extra: str = "allow"  # Allow arbitrary additional fields
+
+
+type CacheDict = dict[str, ToolResult]
 
 
 # the tool class defines the prompt format, before and after
@@ -30,58 +52,243 @@ class Tool(ABC):
     #
     #
 
-    def __init__():
+    def __init__(self):
+        self.name: str = self.__class__.__name__
+        self.cache: CacheDict = {}
+
+    @property
+    def description(self) -> str:
+        """Override this to provide tool description for the model"""
+        return ""
+
+    @property
+    def parameters_schema(self) -> type[BaseModel]:
+        """Override this to define tool parameters schema using Pydantic BaseModel"""
+        return BaseModel
+
+    def call(self, **kwargs: Any) -> ToolResult:
+        """Execute the tool with given arguments and return validated ToolResult"""
+        # Validate input using Pydantic schema
+        validated_params = self.parameters_schema(**kwargs)
+
+        # Check cache first
+        cache_key = json.dumps(validated_params.model_dump(), sort_keys=True)
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+
+        # Execute and validate result
+        result = self.execute(**validated_params.model_dump())
+
+        self.cache[cache_key] = result
+        return result
+
+    @abstractmethod
+    def execute(self, **kwargs: Any) -> ToolResult:
+        """
+        Override this with actual tool implementation.
+        Must return a dict (wrap with ToolResult) with at least a 'result' key containing textual output for LLM.
+        Can include arbitrary additional keys for debugging/tracing.
+        """
         pass
 
-    def call(*args, **kwargs):
-        pass
+    def format_for_model(self) -> str:
+        """Format tool info for model context"""
+        schema = self.parameters_schema.model_json_schema()
+        return f"Tool: {self.name}\nDescription: {self.description}\nParameters: {json.dumps(schema)}"
 
-    def execution_cache(*args, **kwargs):
-        pass
+    # def load_cache(self, cache_dict: dict[]):
+    #     """Pre-warm cache with saved results"""
+    #     self.cache.update(cache_dict)
+    #
+    # TODO: implement load_cache/prewarm and dump_cache (syncing cache obj to disk for persistent storage)
+
+
+@dataclass
+class ToolCallingModelResponse:
+    """Represents a typical model's response, which is capable of both tool calling, and generating final answer"""
+
+    # see the model might be capable of calling multiple tools at once,
+    # in that case, a different structure might be used to represent it
+    # may be call it MultiToolCallingResponse
+
+    # NOTE: for now we are assuming the modality of the model's response includes only text
+    # content is what the model actually produces
+    # but then we parse it, and determine, if any tool call was intended
+    # NOTE: for Model class inheritors, you
+
+    # actual response
+    content: str
+
+    # inferred
+    is_final: bool = False
+    tool_name: str | None = None
+    tool_args: dict[str, Any] | None = None
 
 
 class ToolEngine(ABC):
-    # provides mechanism to decide which tool to call
-    #
-    __allow_pll_calls: bool = False
-    # whether to allow multiple parallel tool calls, before the model is invoked again
+    def __init__(self, tools: list[Tool]):
+        self.tools: list[Tool] = tools
 
-    def __init__():
+    def get_tools_context(self, tools: list[Tool]) -> str:
+        return "\n\n".join([tool.format_for_model() for tool in tools])
+
+    @abstractmethod
+    def loop(
+        self, question: str, image: str | None = None, max_calls: int = 5
+    ) -> Trace:
         pass
 
-    def decide_tools(self, tools: list[Tool], call_model) -> Tool:
-        # it can choose to call multiple tools at once
-        return self.call_model(
-            "Given context: {context} which tool should you call or generate final answer "
+
+class GreedyToolEngine(ToolEngine):
+    def __init__(self, tools: list[Tool], model: "ToolCallingModel"):
+        super().__init__(tools)
+        self.model = model
+
+    def loop(
+        self, question: str, image: str | None = None, max_calls: int = 5
+    ) -> Trace:
+        trace = Trace()
+
+        tools_context = self.get_tools_context(self.tools)
+        context = f"{tools_context}\n\nQuestion: {question}"
+
+        if image:
+            context = f"Image: {image}\n\n{context}"
+
+        calls = 0
+
+        response = self.model.generate(context)
+        trace.push(
+            [
+                ModelCall(
+                    model=self.model.__class__.__name__,
+                    input=context,
+                    images=[image] if image else [],
+                    output=response.content,
+                )
+            ]
         )
+
+        while not response.is_final and calls < max_calls:
+            if response.tool_name and response.tool_args:
+                tool = next(
+                    (t for t in self.tools if t.name == response.tool_name), None
+                )
+
+                if tool is None:
+                    context += f"\n\nError: Tool '{response.tool_name}' not found. Please provide final answer."
+                    response = self.model.generate(context)
+                    trace.push(
+                        [
+                            ModelCall(
+                                model=self.model.__class__.__name__,
+                                input=context,
+                                images=[],
+                                output=response.content,
+                            )
+                        ]
+                    )
+                    break
+
+                tool_output = tool.call(**response.tool_args)
+
+                trace.push(
+                    [
+                        ToolCall(
+                            tool=response.tool_name,
+                            input=response.tool_args,
+                            output=tool_output.model_dump(),
+                        )
+                    ]
+                )
+
+                context += f"\n\nTool: {response.tool_name}\nInput: {json.dumps(response.tool_args)}\nOutput: {json.dumps(tool_output.model_dump())}"
+
+                response = self.model.generate(context)
+                trace.push(
+                    [
+                        ModelCall(
+                            model=self.model.__class__.__name__,
+                            input=context,
+                            images=[],
+                            output=response.content,
+                        )
+                    ]
+                )
+
+                calls += 1
+            else:
+                break
+
+        if calls >= max_calls and not response.is_final:
+            context += (
+                "\n\nMax tool calls reached. Please provide your final answer now."
+            )
+            response = self.model.generate(context)
+            trace.push(
+                [
+                    ModelCall(
+                        model=self.model.__class__.__name__,
+                        input=context,
+                        images=[],
+                        output=response.content,
+                    )
+                ]
+            )
+
+        return trace
 
 
 class Model(ABC):
-    __router: ToolEngine
+    """Abstract base class for language models"""
 
-    def __init__():
+    def __init__(self, **kwargs: Any):
+        # here you define the configs required to initialize the model
+        # any settings or config required
         pass
 
-    def bind(self, router: ToolEngine):
-        # binds the model with a tool router
-        # thus allowing us to generate a final answer, or choose a tool
-        # the generate method will return the model's output
-        # the execution environment is concerned with the implementation of the tool call
-        # the model needs to be called again with updated context
-        router.call_model = self.generate
-
+    @abstractmethod
+    def load(self) -> None:
+        # optional: for local inferencing, this is an extra step
+        # at this step, the model is loaded into the gpu, not before it
         pass
 
-    def generate():
+    @abstractmethod
+    def unload(self) -> None:
+        # optional: incase of local inferencing, the model class should provide a way to unload/free memory
         pass
+
+    @abstractmethod
+    def generate(self, context: str, images: list[Path] | None) -> Any:
+        # decode the model's output, and just return the new string, post the input
+        # we assume the model can me text -> text, or text + image -> text
+        # although the language model will output a str, we are not forcing you to return str, from this func
+        # you can parse it, and return custom objects suitable for your use case's implementation
+        # example using outlines.txt for structured generation
+        # the response type can be any application specific class
+        pass
+
+
+class ToolCallingModel(ABC):
+    @abstractmethod
+    def generate(
+        self, context: str, images: list[Path] | None = None
+    ) -> ToolCallingModelResponse:
+        pass
+
+
+# see Model is just about calling the model
+# the things like force_final etc, does not make sense
+#
 
 
 @dataclass
 class ModelCall:
     model: str
-    input: str
-    # todo handle multimodal input where image is present
-    output: str
+    input: str  # the input context to Model.generate()
+    images: list[str]  # list of file paths used as images for multimodal input
+    output: str  # the output serialized as string
+    # (although Model.generate can return complex objects as output, for tracing purposes, we keep record of a str)
 
     def json(self):
         return json.dumps(asdict(self))
@@ -96,8 +303,10 @@ class ModelCall:
 @dataclass
 class ToolCall:
     tool: str
-    input: dict[str, any]
-    output: dict[str, any]
+    # the name of the tool, unique identifier scoped to applications's context
+
+    input: dict[str, Any]  # the input args to the tool call
+    output: dict[str, Any]  # the output of the tool
 
     def json(self):
         return json.dumps(asdict(self))
@@ -121,12 +330,12 @@ class Trace:
         # Convert each item in the stack to a dict
         return json.dumps(self.obj())
 
-    def obj(self) -> list[TraceLayer]:
-        return [[asdict(item) for item in layer] for layer in self.__stack]
+    def obj(self) -> list[list[dict[str, Any]]]:
+        return [[item.to_dict() for item in layer] for layer in self.__stack]
 
 
 @dataclass
-class Response:
+class AgentResponse:
     confidence: float
     trace: Trace
     answer: str
@@ -175,43 +384,169 @@ class Checkpointer:
             file.write(trace.json())
 
 
+# what is an agent ? its the flow or graph of model invocations
+# now, models cant be invoked from air, model invocations happen tightly coupled with ToolEngine
+# if the model outputs final response its terminated, but if it outputs a tool call, the tool engine is responsible for executing it
+# the tool engine is where we define the model -- tool interaction loop
+#
+#
+#
 @dataclass
 class Agent:
     # customizable, parallizable, interruptible agents
+    # an agent is a graph of object functions
+    # for now, we are implementing a mono-objective function agent
+    # later we will expand to supports graphs (which by default includes linear chains)
+    #
     model: Model
     tools: list[Tool]
-    checkpointer: Checkpointer
+    router: ToolEngine
+    checkpointer: Checkpointer | None = None
+    max_calls: int = 5
 
-    __state: dict[str, any]
-    __max_calls: int = 5
+    def __post_init__(self):
+        """Initialize agent after dataclass creation"""
+        self.__state = {}
+        self.trace = Trace()
 
-    def bind(model, tool_engine):
-        # the binding of model and tool engine happens at the agent level
-        # one model can be used with multiple different tool engines, and similarly
-        # a tool engine can be used with multiple different models
-        # the instantiation of joint(model, tool_engine) is the agent
-        #
-        pass
+        # Bind model and router
+        self.model.bind(self.router)
 
-    def invoke(self, image: str, question: str) -> Response:
-        context = self.router.get_context(self.tools)
-        answer = self.model.generate(context)
+    @property
+    def state(self):
+        return self.__state
+
+    def invoke(self, question: str, image: str = None) -> AgentResponse:
+        """
+        Main execution loop for the agent
+        Iteratively calls model and tools until final answer is reached
+        """
+        # Initialize context with tools and question
+        tools_context = self.router.get_tools_context(self.tools)
+        context = f"{tools_context}\n\nQuestion: {question}"
+
+        if image:
+            context = f"Image: {image}\n\n{context}"
 
         calls = 0
 
-        while not answer.is_final and calls < self.max_calls:
-            tool, args = answer.tool_call
-            context.update(tool.call(args))
-            answer = self.model.generate(context)
-            calls += 1
+        # Initial model call
+        response = self.model.generate(context, force_final=False)
+        self.trace.push(
+            [
+                ModelCall(
+                    model=self.model.__class__.__name__,
+                    input=context,
+                    output=response.content,
+                )
+            ]
+        )
 
-        # when max calls have expired, force the model to generate final answer,
-        # instead of giving it option to call tool
-        return answer
+        # Tool execution loop
+        while not response.is_final and calls < self.max_calls:
+            if response.tool_name and response.tool_args:
+                # Find the tool
+                tool = next(
+                    (t for t in self.tools if t.name == response.tool_name), None
+                )
 
-    def checkpoint(self):
-        # write the current state to disk
-        self.checkpointer.write(self.state)
+                if tool is None:
+                    # Tool not found, force final answer
+                    context += f"\n\nError: Tool '{response.tool_name}' not found. Please provide final answer."
+                    response = self.model.generate(context, force_final=True)
+                    self.trace.push(
+                        [
+                            ModelCall(
+                                model=self.model.__class__.__name__,
+                                input=context,
+                                output=response.content,
+                            )
+                        ]
+                    )
+                    break
+
+                # Execute tool
+                tool_output = tool.call(**response.tool_args)
+
+                # Record tool call
+                self.trace.push(
+                    [
+                        ToolCall(
+                            tool=response.tool_name,
+                            input=response.tool_args,
+                            output=tool_output,
+                        )
+                    ]
+                )
+
+                # Update context with tool result
+                context += f"\n\nTool: {response.tool_name}\nInput: {json.dumps(response.tool_args)}\nOutput: {json.dumps(tool_output)}"
+
+                # Call model again with updated context
+                response = self.model.generate(context, force_final=False)
+                self.trace.push(
+                    [
+                        ModelCall(
+                            model=self.model.__class__.__name__,
+                            input=context,
+                            output=response.content,
+                        )
+                    ]
+                )
+
+                calls += 1
+            else:
+                # No tool call in response, must be final
+                break
+
+        # When max calls have expired, force the model to generate final answer
+        if calls >= self.max_calls and not response.is_final:
+            context += (
+                "\n\nMax tool calls reached. Please provide your final answer now."
+            )
+            response = self.model.generate(context, force_final=True)
+            self.trace.push(
+                [
+                    ModelCall(
+                        model=self.model.__class__.__name__,
+                        input=context,
+                        output=response.content,
+                    )
+                ]
+            )
+
+        # Checkpoint if available
+        if self.checkpointer:
+            self.checkpoint()
+
+        return AgentResponse(
+            confidence=1.0,  # TODO: implement confidence scoring
+            trace=self.trace,
+            answer=response.content,
+        )
+
+    def checkpoint(self, filename: str = None):
+        """Write the current trace to disk"""
+        if self.checkpointer is None:
+            raise Exception(
+                "Checkpointer not found! Failed to write current trace to disk"
+            )
+
+        if filename is None:
+            # Generate filename from timestamp
+            from datetime import datetime
+
+            filename = f"trace_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+
+        self.checkpointer.write(filename, self.trace)
+
+    def update_state(self, key: str, value: any):
+        """Update agent state"""
+        self.__state[key] = value
+
+    def get_state(self, key: str, default=None):
+        """Get value from agent state"""
+        return self.__state.get(key, default)
 
 
 # usage example
@@ -230,14 +565,16 @@ class Agent:
 # )
 
 
-# answer = agent.invoke(image, question)
+# answer = agent.invoke(question="What is 2+2?")
 
 
-# print(answer)  # prints the final answer
+# print(answer.answer)  # prints the final answer
 
-# print(answer.trace)  # prints the full trace that lead to this answer
+# print(answer.trace.json())  # prints the full trace that lead to this answer
 
 
 # TODO: structured output validation
+#
+#
 #
 #
